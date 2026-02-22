@@ -1,0 +1,361 @@
+/***************************************************
+ * IoT Automatic Irrigation System (GSM SIM7000G Version)
+ * Board    : LilyGO T-SIM7000G
+ * Sensors  : 2x Soil Moisture v1.2, 1x Flow Sensor
+ * Actuator : Solenoid Valve (via Relay)
+ * Platform : Blynk IoT + Google Sheets
+ ***************************************************/
+
+// ================================================================
+// SECTION 1: LIBRARIES AND GSM DEFINITIONS
+// ================================================================
+
+#define BLYNK_TEMPLATE_ID ""
+#define BLYNK_TEMPLATE_NAME ""
+
+#define SerialMon Serial
+#define BLYNK_PRINT Serial
+
+#define TINY_GSM_MODEM_SIM7000
+
+#include <TinyGsmClient.h>
+#include <BlynkSimpleTinyGSM.h>
+
+// ================================================================
+// SECTION 2: CREDENTIALS AND CONFIGURATION
+// ================================================================
+
+// Blynk authentication token
+char auth[] = "YOUR_BLYNK_AUTH_TOKEN";
+
+// APN credentials for GSM internet connection
+const char apn[]      = "";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+// Google Apps Script ID (for logging data)
+String GOOGLE_SCRIPT_ID = ""; // <-- Replace with your Script ID
+
+// ================================================================
+// SECTION 3: PIN DEFINITIONS
+// ================================================================
+
+// SIM7000G modem pins
+#define MODEM_RST           5
+#define MODEM_PWRKEY        4
+#define MODEM_POWER_ON      23
+#define MODEM_TX            26
+#define MODEM_RX            27
+#define MODEM_BAUD          9600
+#define MODEM_DTR_PIN       25
+
+// Sensors and actuator pins
+#define SOIL_PIN_1  34
+#define SOIL_PIN_2  35
+#define FLOW_PIN    13
+#define RELAY_PIN   12
+#define LED_PIN     2   // Built-in ESP32 LED
+
+#define SerialAT Serial2
+
+// GSM & Blynk objects
+TinyGsm modem(SerialAT);
+TinyGsmClient client(modem);
+BlynkTimer timer;
+WidgetTerminal terminal(V20);
+
+// ================================================================
+// SECTION 4: CALIBRATION CONSTANTS AND CONTROL PARAMETERS
+// ================================================================
+
+// Soil sensor calibration values (ADC range)
+const int DRY_VALUE_1 = 3100;
+const int WET_VALUE_1 = 1090;
+const int DRY_VALUE_2 = 1230;
+const int WET_VALUE_2 = 330;
+
+// Flow sensor calibration factor
+const float FLOW_CALIBRATION_FACTOR = 368.0;
+
+// Moisture threshold limits
+int minMoistureThreshold = 30;
+int maxMoistureThreshold = 70;
+
+// Timing intervals (milliseconds)
+const unsigned long SENSOR_READ_INTERVAL      = 60000L;
+const unsigned long GOOGLE_LOG_INTERVAL       = 60000L;
+const unsigned long FLOW_CALCULATION_INTERVAL = 1000L;
+const unsigned long BLYNK_RECONNECT_INTERVAL  = 30000L;
+
+const int MAX_RECONNECT_ATTEMPTS = 3;
+
+// ================================================================
+// SECTION 5: GLOBAL VARIABLES
+// ================================================================
+
+volatile unsigned long pulseCount = 0;
+
+unsigned long lastFlowReadTime = 0;
+float currentFlowRateLPM = 0.0;
+float totalVolumeLiters = 0.0;
+
+bool isManualMode = false;
+bool solenoidState = false;
+
+unsigned long lastBlynkConnection = 0;
+int reconnectAttempts = 0;
+bool isSystemInitialized = false;
+
+const int SENSOR_READINGS_COUNT = 10;
+int moisture1Readings[SENSOR_READINGS_COUNT];
+int moisture2Readings[SENSOR_READINGS_COUNT];
+int readingIndex = 0;
+
+// ================================================================
+// FUNCTION: Power On GSM Modem
+// ================================================================
+
+void modemPowerOn() {
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  delay(100);
+
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000);
+}
+
+// ================================================================
+// FLOW SENSOR INTERRUPT
+// ================================================================
+
+void IRAM_ATTR pulseCounterISR() {
+  pulseCount++;
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup() {
+  SerialMon.begin(115200);
+  delay(10);
+
+  SerialMon.println("=== IoT Irrigation System Starting ===");
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  pinMode(MODEM_DTR_PIN, OUTPUT);
+  digitalWrite(MODEM_DTR_PIN, LOW);
+
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounterISR, FALLING);
+
+  // Power modem
+  modemPowerOn();
+
+  SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+
+  modem.restart();
+  delay(5000);
+
+  if (!modem.testAT()) {
+    SerialMon.println("Modem not responding!");
+    while (true);
+  }
+
+  SerialMon.println(modem.getModemInfo());
+
+  if (!modem.waitForNetwork()) {
+    SerialMon.println("Network connection failed.");
+  }
+
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    SerialMon.println("GPRS connection failed.");
+  }
+
+  Blynk.begin(auth, modem, apn, gprsUser, gprsPass);
+
+  timer.setInterval(SENSOR_READ_INTERVAL, readSensorsAndAutomate);
+  timer.setInterval(GOOGLE_LOG_INTERVAL, logDataToGoogleSheets);
+  timer.setInterval(BLYNK_RECONNECT_INTERVAL, checkBlynkConnection);
+
+  isSystemInitialized = true;
+  SerialMon.println("System initialized successfully.");
+}
+
+// ================================================================
+// LOOP
+// ================================================================
+
+void loop() {
+  if (Blynk.connected()) {
+    Blynk.run();
+  }
+  timer.run();
+}
+
+// ================================================================
+// SENSOR FUNCTIONS
+// ================================================================
+
+int getSoilMoisturePercent(int pin, int dryVal, int wetVal) {
+  int rawValue = analogRead(pin);
+  int percentage = map(rawValue, dryVal, wetVal, 0, 100);
+  return constrain(percentage, 0, 100);
+}
+
+int getFilteredMoisture(int pin, int dryVal, int wetVal, int* readings) {
+  readings[readingIndex] = getSoilMoisturePercent(pin, dryVal, wetVal);
+
+  long total = 0;
+  for (int i = 0; i < SENSOR_READINGS_COUNT; i++) {
+    total += readings[i];
+  }
+
+  return total / SENSOR_READINGS_COUNT;
+}
+
+// ================================================================
+// FLOW CALCULATION
+// ================================================================
+
+void calculateFlow() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastFlowReadTime >= FLOW_CALCULATION_INTERVAL) {
+    noInterrupts();
+    unsigned long pulseCopy = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    unsigned long duration = currentTime - lastFlowReadTime;
+
+    if (duration > 0) {
+      currentFlowRateLPM =
+        (1000.0 / duration) * pulseCopy * 60.0 / FLOW_CALIBRATION_FACTOR;
+
+      if (solenoidState && currentFlowRateLPM > 0.1) {
+        float volume = currentFlowRateLPM * (duration / 60000.0);
+        totalVolumeLiters += volume;
+      }
+    }
+
+    lastFlowReadTime = currentTime;
+  }
+}
+
+// ================================================================
+// SOLENOID CONTROL
+// ================================================================
+
+void controlSolenoid(bool turnOn) {
+  if (turnOn != solenoidState) {
+    digitalWrite(RELAY_PIN, turnOn ? LOW : HIGH);
+    solenoidState = turnOn;
+
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(V5, solenoidState ? 0 : 1);
+    }
+  }
+}
+
+// ================================================================
+// AUTOMATIC IRRIGATION LOGIC
+// ================================================================
+
+void readSensorsAndAutomate() {
+  calculateFlow();
+
+  int m1 = getFilteredMoisture(SOIL_PIN_1, DRY_VALUE_1, WET_VALUE_1, moisture1Readings);
+  int m2 = getFilteredMoisture(SOIL_PIN_2, DRY_VALUE_2, WET_VALUE_2, moisture2Readings);
+  int avg = (m1 + m2) / 2;
+
+  readingIndex = (readingIndex + 1) % SENSOR_READINGS_COUNT;
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V0, m1);
+    Blynk.virtualWrite(V1, m2);
+    Blynk.virtualWrite(V2, avg);
+    Blynk.virtualWrite(V3, currentFlowRateLPM);
+    Blynk.virtualWrite(V4, totalVolumeLiters);
+  }
+
+  if (!isManualMode && isSystemInitialized) {
+    if (avg < minMoistureThreshold && !solenoidState) {
+      totalVolumeLiters = 0;
+      controlSolenoid(true);
+    }
+    else if (avg >= maxMoistureThreshold && solenoidState) {
+      controlSolenoid(false);
+    }
+  }
+}
+
+// ================================================================
+// GOOGLE SHEETS LOGGING
+// ================================================================
+
+void logDataToGoogleSheets() {
+  if (!modem.isGprsConnected()) return;
+
+  const char* server = "script.google.com";
+
+  if (!client.connect(server, 443)) return;
+
+  int m1 = getSoilMoisturePercent(SOIL_PIN_1, DRY_VALUE_1, WET_VALUE_1);
+  int m2 = getSoilMoisturePercent(SOIL_PIN_2, DRY_VALUE_2, WET_VALUE_2);
+  int avg = (m1 + m2) / 2;
+
+  String path = "/macros/s/" + GOOGLE_SCRIPT_ID + "/exec";
+  path += "?moisture1=" + String(m1);
+  path += "&moisture2=" + String(m2);
+  path += "&avgMoisture=" + String(avg);
+  path += "&flowRate=" + String(currentFlowRateLPM, 2);
+  path += "&totalVolume=" + String(totalVolumeLiters, 2);
+
+  client.print("GET " + path + " HTTP/1.1\r\n");
+  client.print("Host: script.google.com\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  delay(2000);
+  client.stop();
+}
+
+// ================================================================
+// BLYNK CONNECTION MANAGEMENT
+// ================================================================
+
+void checkBlynkConnection() {
+  if (!Blynk.connected() && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    Blynk.connect();
+    reconnectAttempts++;
+  }
+  else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    ESP.restart();
+  }
+}
+
+BLYNK_WRITE(V10) {
+  isManualMode = param.asInt();
+}
+
+BLYNK_WRITE(V11) {
+  if (isManualMode) {
+    controlSolenoid(param.asInt() == 1);
+  }
+}
+
+BLYNK_WRITE(V12) {
+  minMoistureThreshold = param.asInt();
+}
+
+BLYNK_WRITE(V13) {
+  maxMoistureThreshold = param.asInt();
+}
